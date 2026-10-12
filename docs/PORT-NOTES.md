@@ -93,8 +93,10 @@ re-injects the result the way egui expects: folded into the held state, stamped 
 `PointerButton` event, plus one `ModifiersChanged` per frame. State is carried **between** frames,
 because the press and the click usually land in different ones.
 
-**Checked:** the logic is pure, so five unit tests run on the host (`cargo test -p photocraft-android`
-in this tree) and all five pass — including the cross-frame Shift case that *is* the bug.
+**Checked:** the logic is pure, so five unit tests run on the host. In a tree assembled from scratch
+(fresh `git fetch` of the pin, patch applied, port crate copied in), `cargo test -p photocraft-android`
+passes **5/5** — including `shift_held_in_one_frame_reaches_a_click_in_the_next`, the cross-frame case
+that *is* the bug.
 
 ## 6. No system fonts, and no way to install one — `crates/text/src/fonts.rs`
 
