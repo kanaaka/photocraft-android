@@ -1,0 +1,104 @@
+[package]
+name = "photocraft-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PhotoCraft on Android: the real engine and egui shell on winit's NativeActivity backend"
+publish = false
+
+# cargo-apk turns this cdylib into the APK's lib/<abi>/libphotocraft.so, and the
+# artifact name is what the injected `android.app.lib_name` meta-data points at.
+[lib]
+name = "photocraft"
+crate-type = ["cdylib"]
+
+[features]
+# Open HEIC/HEIF photos, mirroring the upstream app's feature of the same name
+# (apps/photocraft/Cargo.toml: "official builds (CI, packaging/, release) build
+# with --features heif"). It pulls in photocraft-codecs' optional photocraft-heif
+# crate, a pure-Rust decoder (heic-rs) — no C, so it cross-compiles to Android.
+# On by default here: a sideloaded APK has no distributor to choose for it.
+default = ["heif"]
+heif = ["photocraft-codecs/heif"]
+
+[dependencies]
+photocraft-doc = { workspace = true }
+photocraft-engine = { workspace = true }
+photocraft-ui-egui = { workspace = true }
+# The in-app file picker (src/file_picker.rs) draws with egui directly.
+egui = { workspace = true }
+photocraft-io = { workspace = true }
+photocraft-format = { workspace = true }
+photocraft-codecs = { workspace = true }
+# Only for `fonts::set_extra_font_dirs`: registering the app's own Fonts folder, where a user
+# installs a font by dropping a file in over USB.
+photocraft-text = { workspace = true }
+log = { workspace = true }
+
+# Unconditional, not target-gated: the android-* features are inert on other
+# platforms (winit only depends on android-activity under cfg(target_os =
+# "android")), so the workspace stays buildable everywhere.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+# Needed to name `AndroidApp` for `NativeOptions::android_app`; eframe does not
+# re-export it. Pinned to the same version eframe/egui-winit build against.
+winit = { version = "=0.30.13", default-features = false, features = ["android-native-activity"] }
+
+[package.metadata.android]
+package = "ai.storyteller.photocraft"
+apk_name = "photocraft"
+build_targets = ["aarch64-linux-android"]
+strip = "strip"
+# Theme resources — the two edge-to-edge fixes live in res/values/styles.xml.
+resources = "res"
+
+[package.metadata.android.sdk]
+# 26 = Android 8.0: the floor for a modern Vulkan driver surface.
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "PhotoCraft"
+# Launcher icon. Resolves to the adaptive icon on Android 8+ (mipmap-anydpi-v26)
+# and the scaled PNGs below that; generated from the repo's own
+# assets/app-icon/photocraft-1024.png by res/ — see the mipmap folders.
+icon = "@mipmap/ic_launcher"
+# Confirmed working on the tablet: variant B (immersive fullscreen) fixes the
+# menubar sitting under the notification bar. Variant A
+# ("@style/PhotocraftStatusBar") is the alternative — see res/values/styles.xml.
+theme = "@style/PhotocraftFullscreen"
+# The engine mmaps documents and codecs; keep the .so uncompressed so it can be
+# mapped from the APK directly.
+extract_native_libs = true
+
+# Software rendering is a valid fallback (the engine has a CPU compositor), so
+# Vulkan is preferred but not required.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vulkan.level"
+required = false
+version = 1
+
+# Storage access for the in-app picker (src/file_picker.rs). Android 10+ forbids
+# reading shared storage by path, so the picker probes each root and only offers
+# the ones it can actually read — no permission is needed for the app's own
+# folder, and these just widen what is reachable.
+#
+# MANAGE_EXTERNAL_STORAGE ("All files access") cannot be requested at runtime: it
+# is granted by hand in Settings ▸ Apps ▸ PhotoCraft ▸ Special access. Google Play
+# restricts it to file-manager-class apps, which does not apply to a sideloaded build.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+# Reading images without the heavy permission (Android 13+); grant under
+# Settings ▸ Apps ▸ PhotoCraft ▸ Permissions ▸ Photos and videos.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
+
+# Legacy storage permissions, only meaningful before Android 11.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+max_sdk_version = 29

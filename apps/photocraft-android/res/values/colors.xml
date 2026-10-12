@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Measured from assets/app-icon/photocraft-1024.png: the tile blue is a flat
+     fill, which is what lets the adaptive foreground sit on it seamlessly. -->
+<resources>
+    <color name="ic_launcher_background">#2F7BF5</color>
+</resources>

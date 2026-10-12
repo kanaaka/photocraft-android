@@ -1,0 +1,74 @@
+diff --git a/crates/text/src/fonts.rs b/crates/text/src/fonts.rs
+index a0cd5b8..9418e6c 100644
+--- a/crates/text/src/fonts.rs
++++ b/crates/text/src/fonts.rs
+@@ -546,6 +546,19 @@ pub(crate) fn collect_font_files(dir: &std::path::Path, depth: u32, out: &mut Ve
+     }
+ }
+ 
++/// Extra font directories a shell registers for a platform whose fonts the scan cannot find on
++/// its own.
++///
++/// Android: the app's own USB-visible `Fonts` folder, where a user drops a `.ttf` to install it —
++/// the same folder the desktop app sets beside its preferences. One-shot (only the first call
++/// counts) and it must be set before the first scan, so the shell does it before the window opens.
++static EXTRA_FONT_DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
++
++/// Add directories to [`system_font_dirs`]. See [`EXTRA_FONT_DIRS`].
++pub fn set_extra_font_dirs(dirs: Vec<std::path::PathBuf>) {
++    let _ = EXTRA_FONT_DIRS.set(dirs);
++}
++
+ #[cfg(not(target_arch = "wasm32"))]
+ pub(crate) fn system_font_dirs() -> Vec<std::path::PathBuf> {
+     use std::path::PathBuf;
+@@ -578,6 +591,20 @@ pub(crate) fn system_font_dirs() -> Vec<std::path::PathBuf> {
+             v.push(h.join(".fonts"));
+         }
+     }
++    // Android takes the Linux branch above — `cfg!(target_os = "macos")` and `"windows"` are both
++    // false there — and not one of those paths exists on a tablet, so the scan would find no
++    // system fonts at all and every document set in the device's own typeface would fall back.
++    // The system's font folders are these; missing ones are skipped as usual.
++    if cfg!(target_os = "android") {
++        v.push(PathBuf::from("/system/fonts"));
++        v.push(PathBuf::from("/product/fonts"));
++        v.push(PathBuf::from("/system_ext/fonts"));
++        v.push(PathBuf::from("/vendor/fonts"));
++    }
++    // Fonts the shell registered for this platform (Android: the app's own Fonts folder).
++    if let Some(extra) = EXTRA_FONT_DIRS.get() {
++        v.extend(extra.iter().cloned());
++    }
+     v
+ }
+ 
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index a9af622..51f36f5 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -30,7 +30,7 @@ photocraft-format = { workspace = true }
+ photocraft-codecs = { workspace = true }
+ egui = { workspace = true }
+ egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
++eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+ log = { workspace = true }
+@@ -38,6 +38,15 @@ base64 = "0.22"
+ # Inflating the translation catalogs, stored deflated (build.rs); already linked through photocraft-io.
+ flate2 = { workspace = true }
+ 
++# Screen-reader support (accesskit) is desktop-only. eframe rejects the feature
++# combination on Android — `compile_error!("`accesskit` feature is only
++# available with `android-game-activity`")` — because on Android egui's accesskit
++# integration goes through the GameActivity backend, while the Android port
++# packages NativeActivity. Cargo applies features only from target tables whose
++# cfg matches, so desktop keeps accesskit and Android drops it.
++[target.'cfg(not(target_os = "android"))'.dependencies]
++eframe = { workspace = true, features = ["accesskit"] }
++
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ rayon = { workspace = true }
+ # Safe native UI-language APIs (Windows/macOS); no subprocess or web dependency.
