@@ -87,6 +87,28 @@ fn export_options(settings: &ExportSettings) -> photocraft_io::ExportOptions {
     opts
 }
 
+/// Encode and write on a worker thread (`Services::save_file`).
+///
+/// Mirrors the desktop shell's `save_through`. With background jobs on the app uses this instead
+/// of `export` + `write` (`write_document`), so a large save cannot stall the event loop — which
+/// on Android is the difference between a progress tab and the watchdog offering "Force close"
+/// while the save is still running.
+fn save_file(
+    doc: &Document,
+    path: &str,
+    settings: &ExportSettings,
+    ctl: &photocraft_ui_egui::jobs_ui::SaveCtl,
+) -> Result<Vec<String>, String> {
+    ctl.progress(0.0, "Encoding");
+    let opts = export_options(settings);
+    let r = photocraft_io::export(doc, path, &opts).map_err(|e| e.to_string())?;
+    // Past this point the save can no longer be cancelled, or the target would be left half-written.
+    ctl.commit()?;
+    ctl.progress(0.0, "Writing");
+    photocraft_format::atomic_write(Path::new(path), &r.bytes).map_err(|e| e.to_string())?;
+    Ok(r.warnings)
+}
+
 /// The platform-neutral half of the desktop `services::native()`.
 ///
 /// Everything omitted here is omitted deliberately — see the crate docs. The
@@ -108,6 +130,10 @@ fn android_services() -> Services {
                     .map_err(|e| e.to_string())
             },
         )),
+        // The worker-thread save. Required once `background_jobs` is on: `write_document` uses
+        // this when it is present and otherwise falls back to `export` + `write` *on the event
+        // loop*, which is what produced the watchdog's "Force close" offer mid-save.
+        save_file: Some(std::sync::Arc::new(save_file)),
         write: Some(Box::new(|path: &str, bytes: &[u8]| {
             photocraft_format::atomic_write(Path::new(path), bytes).map_err(|e| e.to_string())
         })),
@@ -244,6 +270,15 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
                 file_picker::request(&for_dialog, request, reply);
             }));
             let mut app = PhotocraftApp::new(Session::new(), services);
+            // Long commands and file opens as background jobs with progress and Cancel (#210).
+            //
+            // The desktop turns this on and the default is OFF — "tests and scripts rely on" the
+            // inline path. Leaving it unset ran every long operation inline on the event-loop
+            // thread: the loop stopped draining input, and Android's watchdog offered "Force
+            // close" after ~5s while the work carried on and finished anyway, which is exactly the
+            // ANR the tablet showed. With this on, `write_document` also uses `Services::save_file`
+            // (worker thread) instead of `export` + `write` here — both halves are needed.
+            app.background_jobs = true;
             // Put the canvas on the GPU when the device gave us a wgpu device;
             // otherwise the engine's CPU compositor carries it.
             if let Some(rs) = cc.wgpu_render_state.clone() {

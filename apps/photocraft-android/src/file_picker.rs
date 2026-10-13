@@ -185,6 +185,11 @@ fn readable(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok()
 }
 
+/// Whether this folder lives in Android's *shared* storage rather than the app's own area.
+fn is_shared(dir: &Path) -> bool {
+    dir.starts_with(SHARED_ROOT) && !dir.starts_with(Path::new(SHARED_ROOT).join("Android"))
+}
+
 /// Directory entries, folders first, filtered by `extensions` when given.
 fn entries(dir: &Path, extensions: Option<&Vec<String>>) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -295,11 +300,27 @@ pub fn draw(ctx: &egui::Context, shared: &Rc<RefCell<Shared>>) {
                 Err(e) => {
                     ui.label("Cannot read this folder.");
                     ui.label(egui::RichText::new(e.clone()).monospace().weak());
-                    ui.label("Grant \"All files access\" in Settings \u{25B8} Apps \u{25B8} PhotoCraft \u{25B8} Special access to browse shared storage.");
+                    ui.label("Grant \"All files access\" in Settings > Apps > PhotoCraft > Special access to browse shared storage.");
                 }
                 Ok((dirs, files)) => {
                     if dirs.is_empty() && files.is_empty() {
                         ui.label("(empty \u{2014} no matching files)");
+                        // Android lists a folder the app cannot see as EMPTY rather than failing, so
+                        // an empty result is never proof the folder is empty. The grant cannot be
+                        // probed from here either: `/storage/emulated/0/Android/data` stays
+                        // unlistable to this app on API 35 *even with* "All files access" granted
+                        // (measured on the emulator — the first attempt at this used it as the tell
+                        // and told a granted user to grant). So word it conditionally and let the
+                        // user decide, rather than claiming a state we cannot see.
+                        if is_shared(&dir) {
+                            ui.label(
+                                egui::RichText::new(
+                                    "If your files are here, the app may lack shared-storage access: Settings > Apps > PhotoCraft > Special access > All files access.",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
                     }
                     for d in dirs {
                         if ui.button(format!("\u{1F4C1} {}", file_label(d))).clicked() {
@@ -360,8 +381,21 @@ pub fn draw(ctx: &egui::Context, shared: &Rc<RefCell<Shared>>) {
                 }
             });
 
-            if dir == default_dir() {
-                ui.label(egui::RichText::new("Tip: push files here over USB, or grant \"All files access\" to browse the whole tablet.").weak().small());
+            // The USB advice has to depend on the folder, because Android makes the obvious wording
+            // wrong: Android 11+ hides `Android/data` from MTP, so a file copied into the app's own
+            // folder over a cable never arrives and the folder just looks empty — which reads as a
+            // picker bug. `Android/media` *is* visible over MTP, which is why the Fonts folder lives
+            // there.
+            let android = Path::new(SHARED_ROOT).join("Android");
+            let tip = if dir.starts_with(android.join("data")) {
+                "A cable cannot reach this folder: Android 11+ hides Android/data from MTP. Copy files into Download instead, or grant \"All files access\"."
+            } else if dir.starts_with(android.join("media")) {
+                "A cable can reach this folder \u{2014} files copied here (e.g. a font into Fonts) are picked up on the next scan."
+            } else {
+                ""
+            };
+            if !tip.is_empty() {
+                ui.label(egui::RichText::new(tip).weak().small());
             }
         });
 

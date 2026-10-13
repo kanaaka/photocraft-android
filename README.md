@@ -8,8 +8,8 @@ and egui interface, packaged as a NativeActivity APK for sideloading on arm64 de
 | Upstream project | [`storytold/photocraft`](https://github.com/storytold/photocraft) — Apache-2.0 OR MIT |
 | Pinned commit | `7a6058e` (upstream version `0.7.0`) |
 | Android package | `ai.storyteller.photocraft` |
-| Published APK | `photocraft-0.7.0-arm64-v8a-fonts-keys.apk` — 25.2 MB, arm64-v8a, signed |
-| APK sha256 | `314cf5dbc062c3bcef8233f55d89a2b3a627c881760c0d4eb6a12033de373cc9` |
+| Published APK | `photocraft-0.7.0-arm64-v8a-20261013.apk` — 25.2 MB, arm64-v8a, signed (release **v0.1.1**, 2026-10-13) |
+| APK sha256 | `4cfcfc2a87399f23c3af67c4eb16907e58550f648dc09c9a716c15377a926e27` |
 | Upstream files changed | 2 files — see [`patches/`](patches/) |
 | New port crate | `apps/photocraft-android/` — 906 lines of Rust plus resources |
 
@@ -73,9 +73,10 @@ A tick means the check was *run*, not inferred; the wording says how far it goes
 | Claim | How it was checked | Result |
 |---|---|---|
 | `patches/…patch` applies to a clean checkout of the pin | fresh `git init` + `git fetch --depth 1 origin 7a6058e6b4a5dbb725e75e97f7ee019d2bfb7f0f` + `git apply --check` | ✅ applies cleanly |
-| The assembled tree equals the tree the APK was built from | file-by-file SHA-256 (line endings normalised) over every patched file and every file of the port crate | ✅ 19 files identical, none differing |
+| The assembled tree equals the tree the APK was built from | file-by-file SHA-256 (line endings normalised) over every patched file and every file of the port crate | ✅ 17 files identical, none differing |
 | The port crate compiles for Android | `cargo check -p photocraft-android --target aarch64-linux-android`, run in a tree assembled from scratch (fresh `git fetch` of the pin, patch applied, port crate copied in) | ✅ exit 0 (host `cargo check -p photocraft` stays green after the shared-crate patch) |
 | Modifier-key synthesis (Ctrl / Shift / Alt) | `cargo test -p photocraft-android` (host, pure logic) | ✅ 5/5 pass, including the cross-frame Shift case that *is* the bug |
+| The port crate's own tests | `cargo test -p photocraft-android` in the freshly assembled tree | ✅ 5/5 pass |
 | APK is signed and is the right artifact | `apksigner verify --verbose`, `aapt2 dump badging`, sha256 | ✅ v2/v3 signatures true, `native-code: 'arm64-v8a'`, package `ai.storyteller.photocraft` |
 | Behaviour on real hardware | hand-testing on the porter's arm64 tablet | ⚠️ the fixes below were found and driven by that testing; each published binary is not individually re-verified here |
 

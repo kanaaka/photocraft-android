@@ -178,6 +178,40 @@ launcher shows a name.
 
 Everything else lives in `apps/photocraft-android/` and touches no upstream file.
 
+## 2026-10-13 — A save no longer blocks the event loop (the "Force close" ANR)
+
+**The complaint:** saving or exporting a large document made Android offer *Force close* while the
+work carried on and finished anyway — the watchdog's verdict on a UI thread that has stopped
+draining input for ~5 seconds.
+
+**Why:** PhotoCraft's long operations have a background-job path (`jobs_ui` with progress and Cancel),
+and the desktop turns it on while the default is **off** ("tests and scripts rely on" the inline
+path). The port left it off, so every long command and every document write ran inline on the event
+loop, and `write_document` re-ran `export` + `write` there instead of on a worker.
+
+**The change:** `app.background_jobs = true`, plus the worker-thread `save_file` service it requires
+(`Services::save_file`). Both halves are needed: with the flag on but no `save_file`, `write_document`
+still falls back to `export` + `write` on the loop.
+
+**Checked:** the release build for this change is the one named `…-noanr.apk` in the porter's local
+history; the shell compiles for `aarch64-linux-android` and the desktop check stays green.
+
+## 2026-10-13 — The picker no longer tells a *granted* user to grant access
+
+The empty-folder message in shared storage used to end with "Grant *All files access*…", and it was
+shown to everyone, including users who had already granted it. The trigger had been
+`/storage/emulated/0/Android/data` failing to list — **measured on the emulator: that folder stays
+unlistable to the app on API 35 even with the grant**, so the tell was wrong and the advice was
+insulting to the one user who had done what it asked.
+
+Now the note is conditional on the folder being shared storage, is worded as a possibility ("If your
+files are here, the app may lack shared-storage access…"), and leaves the decision to the user,
+because the grant cannot be probed from inside the app.
+
+The USB tip became folder-dependent for the same reason — Android 11+ hides `Android/data` from MTP,
+so a file copied there over a cable never arrives and the folder merely looks empty (which reads as a
+picker bug), while `Android/media` *is* reachable over a cable. Saying the wrong one of those two is
+worse than saying nothing.
 ## What is deliberately *not* in the patch
 
 `Cargo.lock` is excluded on purpose: it moves only because the port crate is a new workspace member,
@@ -186,6 +220,6 @@ and `cargo` regenerates it on the first build. The patch contains only changes t
 
 ## Not verified here
 
-The released APK was not re-run on a device as part of publishing this repository. The fixes above
+The APK attached to **v0.1.1** was built from exactly this tree on 2026-10-13 (upstream pin + the patch + the port crate), and the checks in the README's verification table were run against it. What that does *not* buy is a runtime claim: it was not launched on a device or emulator as part of publishing, so every behavioural statement below rests on the hand-testing the porter did on an arm64 tablet. The fixes above
 were found and iterated on the porter's arm64 tablet, and the binary shipped in Releases is the one
 that build produced; there is no automated device test in this repository.
