@@ -44,6 +44,12 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-nativ
 # re-export it. Pinned to the same version eframe/egui-winit build against.
 winit = { version = "=0.30.13", default-features = false, features = ["android-native-activity"] }
 
+# JNI, for Android's own file picker (`src/activity.rs`). Target-gated: jni-sys runs bindgen
+# over its bundled headers, which has no business being a build requirement of the host test
+# run. The version is the one android-activity 0.6 already pulls in, so both share one copy.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22.4"
+
 [package.metadata.android]
 package = "ai.storyteller.photocraft"
 apk_name = "photocraft"
@@ -67,9 +73,93 @@ icon = "@mipmap/ic_launcher"
 # menubar sitting under the notification bar. Variant A
 # ("@style/PhotocraftStatusBar") is the alternative — see res/values/styles.xml.
 theme = "@style/PhotocraftFullscreen"
+# There is code after all: `java/…/PickerActivity.java` (compiled into the APK's classes.dex by
+# scripts/add-picker-activity.sh) is a NativeActivity subclass of about forty lines, and without
+# `hasCode` the package manager never builds a class loader for it — the Activity in the
+# manifest would then not exist at runtime.
+has_code = true
 # The engine mmaps documents and codecs; keep the .so uncompressed so it can be
 # mapped from the APK directly.
 extract_native_libs = true
+
+# One window, or two windows and no way out of them.
+#
+# The default launch mode is `standard`: tapping the launcher icon while PhotoCraft is
+# already running starts a *second* Activity in the same task. That second Activity is a
+# second `ANativeActivity`, so android-activity runs `android_main` again on a second
+# thread with a second winit event loop and a second window. Whichever one the system
+# gives the input focus is the one taps go to, and the other is unusable — the observed
+# symptom was a window nobody could touch and nobody could close. `singleTask` reuses the
+# running Activity instead (it gets `onNewIntent`), and `src/lib.rs` refuses a second
+# instance outright for the cases a launch mode cannot cover.
+#
+# Its own table because `activity` is a nested element, not a key of `application`.
+[package.metadata.android.application.activity]
+# Not `android.app.NativeActivity`: that class has no `onActivityResult`, so a native library
+# that starts an activity for a result is never told the answer (see the Java source). This
+# subclass adds it and a few one-line native callbacks; everything else is inherited.
+name = "ai.storyteller.photocraft.PickerActivity"
+launch_mode = "singleTask"
+# cargo-apk's default is `orientation|keyboardHidden|screenSize`, which is not enough: any
+# *other* configuration change — the system font size, the language, dark mode — destroys and
+# recreates the Activity, and a recreated Activity is the duplicate `android_main` refuses. So
+# the app is told to handle every configuration change itself instead. winit builds its
+# egui pixels-per-point from the native window and re-reads it on the next `WindowEvent`, and
+# the theme is immersive with no insets to consume, so there is nothing here for the platform
+# to do by recreating the window.
+config_changes = "orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|uiMode|layoutDirection|locale"
+
+# *Open with*: PhotoCraft is offered for the files it can open. Two filters, because the two
+# ways a file manager can name a file do not agree:
+#
+#   * by MIME type, which is what the gallery and DocumentsUI normally send, and
+#   * by extension, for a .psd that a provider reports as `application/octet-stream` — which is
+#     what it does when it has never heard of the extension. Without the second filter such a
+#     file would not list PhotoCraft at all.
+#
+# `DEFAULT` is what puts an Activity in an *Open with* list at all; `BROWSABLE` lets the web
+# too. The `content` and `file` schemes cover DocumentsUI and a plain file path. cargo-apk adds
+# its own MAIN/LAUNCHER filter beside these, because none of these is MAIN.
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT", "android.intent.category.BROWSABLE"]
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+scheme = "content"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+scheme = "file"
+
+# Every image — jpeg, png, webp, gif, tiff, heic, raw — plus Photoshop's PSD in the spellings
+# providers use for it.
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "image/*"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "image/vnd.adobe.photoshop"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "application/x-photoshop"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "application/vnd.adobe.photoshop"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "image/x-psd"
+
+# Extension only, no MIME type: a filter with both would need both to match.
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT", "android.intent.category.BROWSABLE"]
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+scheme = "content"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+scheme = "file"
+
+[[package.metadata.android.application.activity.intent_filter.data]]
+path_pattern = '.*\.(psd|psb)'
 
 # Software rendering is a valid fallback (the engine has a CPU compositor), so
 # Vulkan is preferred but not required.
@@ -78,14 +168,14 @@ name = "android.hardware.vulkan.level"
 required = false
 version = 1
 
-# Storage access for the in-app picker (src/file_picker.rs). Android 10+ forbids
-# reading shared storage by path, so the picker probes each root and only offers
-# the ones it can actually read — no permission is needed for the app's own
-# folder, and these just widen what is reachable.
+# Storage access for the in-app browser fallback (src/file_picker.rs). The system file
+# picker this port now uses for Open and Save As needs none of these; the browser only
+# runs when that picker cannot be started, and Android 10+ refuses a `read_dir` of shared
+# storage by path without the grant, so it probes each root and offers only what it can read.
 #
-# MANAGE_EXTERNAL_STORAGE ("All files access") cannot be requested at runtime: it
-# is granted by hand in Settings ▸ Apps ▸ PhotoCraft ▸ Special access. Google Play
-# restricts it to file-manager-class apps, which does not apply to a sideloaded build.
+# MANAGE_EXTERNAL_STORAGE ("All files access") cannot be requested at runtime: it is
+# granted by hand in Settings ▸ Apps ▸ PhotoCraft ▸ Special access. Google Play restricts
+# it to file-manager-class apps, which does not apply to a sideloaded build.
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
