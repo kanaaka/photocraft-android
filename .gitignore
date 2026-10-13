@@ -1,6 +1,65 @@
-# build output and local signing material — never part of this repository
-target/
-*.apk
+# What must never reach GitHub: signing material, build output, local machine state.
+#
+# Everything in this repository is either documentation, the patch against upstream, or the
+# Android shell crate itself. None of it is secret, and none of it is generated.
+
+# Signing material — the one thing here that could cost someone their upload key, and the one
+# thing that must never be committed by accident. `scripts/build-apk.sh` expects a keystore
+# under a path outside the checkout (android-tools/<app>-sideload.keystore) precisely so it
+# cannot land here.
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.der
+*.key
+*.csr
+keystore.properties
+key.properties
+signing.properties
+release.keystore.properties
+.env
+.env.*
+!.env.example
+
+# Build output.
+target/
+**/target/
+build/
 .gradle/
+*.apk
+*.aab
+*.apks
+*.ap_
+*.idsig
+*.dex
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local machine state. `local.properties` points at an SDK path, `*.sh` scripts are sourced
+# from an environment this repository does not carry, and logs are the app's own runtime trace
+# (a file in the app's data directory on the device, or dropped here by hand while debugging).
+local.properties
+android-sdk/
+android-ndk/
+*.log
+logs/
+
+# Editor and IDE state.
+.idea/
+*.iml
+.vscode/
+.fleet/
+*.swp
+*~
+*.bak
+*.orig
+*.rej
+
+# Operating system debris.
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/

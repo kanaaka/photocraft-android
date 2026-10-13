@@ -51,6 +51,7 @@ use photocraft_doc::Document;
 use photocraft_engine::Session;
 use photocraft_ui_egui::{ExportSettings, PhotocraftApp, Services};
 
+mod activity;
 mod file_picker;
 mod modifiers;
 
@@ -61,6 +62,10 @@ mod modifiers;
 /// sandbox — which is why preferences and exports land here rather than in
 /// shared storage.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set once `android_main` has claimed the process for a window.
+#[cfg(target_os = "android")]
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn prefs_file() -> Option<PathBuf> {
     DATA_DIR.get().map(|d| d.join("preferences.json"))
@@ -93,6 +98,11 @@ fn export_options(settings: &ExportSettings) -> photocraft_io::ExportOptions {
 /// of `export` + `write` (`write_document`), so a large save cannot stall the event loop — which
 /// on Android is the difference between a progress tab and the watchdog offering "Force close"
 /// while the save is still running.
+///
+/// A save that went through Android's file picker is written to a staging file, because the
+/// destination is a `content://` URI and this is the one thread where the copy may be large:
+/// [`activity::copy_staged`] pushes the bytes to where the user asked for them. Anything else —
+/// a path the user can already reach — is left alone.
 fn save_file(
     doc: &Document,
     path: &str,
@@ -106,6 +116,8 @@ fn save_file(
     ctl.commit()?;
     ctl.progress(0.0, "Writing");
     photocraft_format::atomic_write(Path::new(path), &r.bytes).map_err(|e| e.to_string())?;
+    // The document is only "saved" once its bytes are where the user asked for them.
+    activity::copy_staged(path)?;
     Ok(r.warnings)
 }
 
@@ -135,7 +147,11 @@ fn android_services() -> Services {
         // loop*, which is what produced the watchdog's "Force close" offer mid-save.
         save_file: Some(std::sync::Arc::new(save_file)),
         write: Some(Box::new(|path: &str, bytes: &[u8]| {
-            photocraft_format::atomic_write(Path::new(path), bytes).map_err(|e| e.to_string())
+            photocraft_format::atomic_write(Path::new(path), bytes).map_err(|e| e.to_string())?;
+            // `export` + `write` is the inline path, used by Export As and by anything else
+            // that does not go through `save_file`. It runs on the event loop, so a save
+            // through the Android picker is finished on a worker rather than here.
+            finish_staged_save(path)
         })),
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = photocraft_codecs::Image::from_u8(
@@ -177,6 +193,22 @@ fn android_services() -> Services {
         })),
         ..Default::default()
     }
+}
+
+/// Put a staged save where the user asked for it, off the event loop.
+///
+/// Only Android's file picker ever stages a save; every other path returns at once.
+fn finish_staged_save(path: &str) -> Result<(), String> {
+    if activity::save_target(path).is_none() {
+        return Ok(());
+    }
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = activity::copy_staged(&path) {
+            log::error!("the staged save {path} did not reach the file the user chose: {e}");
+        }
+    });
+    Ok(())
 }
 
 /// A minimal file logger, so a sideloaded APK leaves a readable trace.
@@ -237,7 +269,7 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = DATA_DIR.set(data_dir.clone());
     // The app's external files directory: always readable and writable with no
-    // permission, so the picker can fall back to it for both open and save.
+    // permission, so the in-app browser can fall back to it for both open and save.
     if let Some(ext) = app.external_data_path() {
         let _ = std::fs::create_dir_all(&ext);
         let _ = file_picker::EXT_DIR.set(ext);
@@ -248,6 +280,24 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         photocraft_engine::build_info::long_version(),
         data_dir.display()
     );
+
+    // The Java Activity, for the system file picker and for finishing this one.
+    activity::install(app.clone());
+
+    // One window, one event loop, one process.
+    //
+    // A second `Activity` is a second `ANativeActivity`, so `android-activity` runs this
+    // function again on a second thread: a second winit event loop and a second window,
+    // fighting over the same process. That is the trap the tablet fell into — the newcomer
+    // holds the input focus while the window that is actually on top is dead to touches, so
+    // neither can be used and neither can be closed without killing the app. The manifest
+    // asks for `singleTask`, which is what stops the launcher doing this in the first
+    // place; this is the belt to that braces, for the cases a launch mode cannot cover.
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log::error!("a second Activity arrived while one was already running; closing it and keeping the running window");
+        activity::finish();
+        return;
+    }
 
     // Before the window opens: the font scan is one-shot and the first one to run wins, so the
     // app's own Fonts folder has to be registered here or it is never seen (`file_picker`).
@@ -262,6 +312,11 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         "PhotoCraft",
         options,
         Box::new(|cc| {
+            // egui embeds extra viewports on Android already (`eframe` sets this to
+            // `!IS_DESKTOP`), so Window . Arrange . New Window and the Camera Raw dialog
+            // draw inside this window instead of asking winit for an OS window it cannot
+            // make. Stated here so the invariant is in this file, not only in eframe's.
+            cc.egui_ctx.set_embed_viewports(true);
             let shared = file_picker::channel();
             let mut services = android_services();
             // Without this, `ask_file` returns CANCELLED and Open/Save do nothing.
@@ -309,8 +364,27 @@ struct Shell {
     shared: Rc<std::cell::RefCell<file_picker::Shared>>,
 }
 
+impl Shell {
+    /// Open anything the user opened the app with from a file manager or the gallery.
+    ///
+    /// *Open with* sends an `ACTION_VIEW` intent to the Activity, which the Java side forwards here
+    /// as a `content://` URI (`activity.rs`). The bytes are read on a worker, so they arrive here a
+    /// frame or more later, and they are opened as *contents* rather than as a path: a URI is not a
+    /// path, and a document the app has no path for asks where to save instead of pretending the
+    /// provider's URI is a file on disk.
+    fn open_files_the_system_handed_us(&mut self) {
+        for (name, bytes) in activity::take_opened() {
+            log::info!("opened with the app: {name} ({} bytes)", bytes.len());
+            if let Err(e) = self.inner.open_bytes(&name, &bytes) {
+                log::error!("could not open {name}: {e}");
+            }
+        }
+    }
+}
+
 impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.open_files_the_system_handed_us();
         eframe::App::logic(&mut self.inner, ctx, frame);
     }
 
@@ -330,6 +404,8 @@ impl eframe::App for Shell {
         eframe::App::ui(&mut self.inner, ui, frame);
         // After the app, so the picker floats above the editor.
         file_picker::draw(ui.ctx(), &self.shared);
+        // Files being read into, or written out to, the place Android's picker chose.
+        activity::overlay(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

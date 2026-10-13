@@ -1,4 +1,4 @@
-//! An in-app file picker for Android.
+//! The file dialog seam: Android's own picker first, this browser as the fallback.
 //!
 //! # Why this exists
 //!
@@ -11,8 +11,19 @@
 //!
 //! so File ▸ Open and Save As are *silently treated as cancelled* — the app looks
 //! like it has no file access at all. The desktop build fills that slot with
-//! `rfd`; Android has no equivalent available to a NativeActivity with no Java,
-//! so this module draws the picker with egui instead.
+//! `rfd`, which has no Android backend at all.
+//!
+//! On Android the slot is filled with the Storage Access Framework instead (see
+//! [`crate::activity`]), because a browser written here can only ever show what
+//! `read_dir` returns: no cloud providers, no the Downloads collection as Android
+//! sees it, no card reader, and on Android 10+ nothing at all outside the app's own
+//! directory unless *All files access* was granted by hand.
+//!
+//! This module keeps the browser that was here before, for the one case the system
+//! picker cannot cover: a device whose DocumentsUI is missing or broken, where
+//! `startActivityForResult` throws. Both draw through the same [`Shared`] state and
+//! answer through the same `FileDialogReply`, so which one ran is invisible to the
+//! app.
 //!
 //! # How it plugs in
 //!
@@ -23,11 +34,15 @@
 //! request and the reply, return at once, and send the answer from a later frame
 //! through [`FileDialogReply::send`] — which is what [`Shared`] is for.
 //!
+//! [`crate::activity`] answers through the same channel: it never touches
+//! `Shared::pending`'s reply, it only leaves an answer to be picked up by [`draw`].
+//!
 //! # Permissions
 //!
-//! Android 10+ forbids reading `/storage/emulated/0/Download` by path. Two routes
-//! exist and this picker works with either, because it probes each root and only
-//! offers the ones it can actually read:
+//! The system picker needs no permission at all, which is most of the point of it.
+//! The fallback browser below is what needs them: Android 10+ forbids reading
+//! `/storage/emulated/0/Download` by path, and it works around that by probing each
+//! root and only offering the ones it can actually read:
 //!
 //! - **App folder** — `<external_data_path>/`, the app's own directory. Always
 //!   readable and writable, no permission at all. Files can be pushed here over
@@ -35,17 +50,14 @@
 //! - **Shared storage** — Download / Pictures / DCIM / Documents. Needs
 //!   "All files access" (`MANAGE_EXTERNAL_STORAGE`, granted by hand in
 //!   Settings ▸ Apps ▸ Special access) or `READ_MEDIA_IMAGES` for reading media.
-//!
-//! The proper alternative — the Storage Access Framework, i.e. the real Android
-//! picker with no permission — needs Java to receive `onActivityResult`, and
-//! `android-activity` does not expose `startActivityForResult`. That is future
-//! work, not a gap here.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use photocraft_ui_egui::{FileDialogAnswer, FileDialogReply, FileDialogRequest};
+
+use crate::activity;
 
 /// The app's external files directory, captured in `android_main`.
 pub static EXT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -66,6 +78,10 @@ pub struct Shared {
     picked: Vec<PathBuf>,
     /// Whether the starting directory was already applied.
     started: bool,
+    /// Android's picker has this dialog; the browser below stays closed.
+    system: bool,
+    /// The system picker's answer, once there is one.
+    answer: Option<Option<FileDialogAnswer>>,
 }
 
 struct Pending {
@@ -87,17 +103,34 @@ pub fn channel() -> Rc<RefCell<Shared>> {
     Rc::new(RefCell::new(Shared::default()))
 }
 
-/// The `FileDialogFn` body: queue the request and return immediately.
+/// The `FileDialogFn` body: hand the request to Android's picker, and return immediately.
+///
+/// The browser below takes over only if the system picker cannot be started at all —
+/// a device with no DocumentsUI to answer the intent.
 pub fn request(shared: &Rc<RefCell<Shared>>, request: FileDialogRequest, reply: FileDialogReply) {
     let mut s = shared.borrow_mut();
     let (multiple, extensions, suggested) = match &request {
         FileDialogRequest::Open { multiple, extensions, .. } => (*multiple, extensions.clone(), None),
         FileDialogRequest::Save { suggested } => (false, None, Some(suggested.clone())),
     };
+    let (system, note) = match activity::launch(&request) {
+        Ok(()) => (true, None),
+        Err(e) => {
+            if activity::available() {
+                log::warn!("the Android file picker would not start ({e}); using the in-app browser");
+                (false, Some(format!("Android's file picker would not start ({e}).\nUsing the in-app browser instead.")))
+            } else {
+                // Off Android — the host tests, which drive this browser directly.
+                (false, None)
+            }
+        }
+    };
     s.pending = Some(Pending { request, multiple, extensions, suggested, reply: Some(reply) });
     s.picked.clear();
     s.started = false;
-    s.note = None;
+    s.note = note;
+    s.system = system;
+    s.answer = None;
 }
 
 /// `<external storage>/Android/media/<package>`: the app's own media folder.
@@ -226,9 +259,40 @@ fn is_save(s: &Shared) -> bool {
 
 /// Draw the picker if a dialog is queued. Called from the shell after the app's
 /// own `ui`, so the window floats on top of the editor.
+///
+/// Android's picker draws itself in another Activity, so all that is left to do here is
+/// to keep the frame loop alive while it is up and to hand its answer on.
 pub fn draw(ctx: &egui::Context, shared: &Rc<RefCell<Shared>>) {
     let mut s = shared.borrow_mut();
     if s.pending.is_none() {
+        return;
+    }
+    if s.system {
+        match activity::poll() {
+            Some(activity::Outcome::Answer(answer)) => s.answer = Some(answer),
+            Some(activity::Outcome::Failed(e)) => {
+                log::warn!("the Android file picker failed ({e}); using the in-app browser");
+                s.system = false;
+                s.started = false;
+                s.note = Some(format!("Android's file picker did not work ({e}).\nUsing the in-app browser instead."));
+            }
+            Some(activity::Outcome::Waiting) | None => {}
+        }
+    }
+    if let Some(answer) = s.answer.take() {
+        if let Some(pending) = s.pending.take() {
+            if let Some(reply) = pending.reply {
+                reply.send(answer);
+            }
+        }
+        s.picked.clear();
+        s.system = false;
+        return;
+    }
+    if s.system {
+        // The app asks for a frame only about once a second while it waits for an answer,
+        // so the reply would otherwise sit unnoticed for up to that long.
+        ctx.request_repaint();
         return;
     }
     // First frame: pick a starting directory.
